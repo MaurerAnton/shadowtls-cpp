@@ -1,0 +1,1179 @@
+#include "engine.hpp"
+
+// ===== TlsAddrs implementation =====
+std::vector<std::string> TlsAddrs::split(const std::string& s, char delim) {
+    std::vector<std::string> r;
+    size_t start = 0, end;
+    while ((end = s.find(delim, start)) != std::string::npos) {
+        auto part = s.substr(start, end - start);
+        if (!part.empty()) r.push_back(part);
+        start = end + 1;
+    }
+    auto last = s.substr(start);
+    if (!last.empty()) r.push_back(last);
+    return r;
+}
+
+TlsAddrs TlsAddrs::parse(const std::string& arg) {
+    TlsAddrs r;
+    // Split by ';'. Last segment is fallback. Others map sni->target.
+    // Format per segment: "sni" (sni->sni:443), "sni:port" (sni->sni:port),
+    // "sni:ip:port" (sni->ip:port), "host:port" (host->host:port)
+    auto parts = split(arg, ';');
+    if (parts.empty()) return r;
+
+    // Parse fallback (last segment)
+    r.fallback = parts.back();
+    if (r.fallback.find(':') == std::string::npos) r.fallback += ":443";
+
+    // Parse dispatch entries (all but last)
+    for (size_t i = 0; i + 1 < parts.size(); i++) {
+        std::string& seg = parts[i];
+        // Split by ':' to find sni key and optional port/ip
+        auto cols = split(seg, ':');
+        if (cols.size() == 1) {
+            // "sni" -> sni->sni:443
+            r.dispatch[cols[0]] = cols[0] + ":443";
+        } else if (cols.size() == 2) {
+            // "sni:port" or "host:port" -> key->value
+            r.dispatch[cols[0]] = cols[0] + ":" + cols[1];
+        } else if (cols.size() >= 3) {
+            // "sni:ip:port" -> sni maps to ip:port
+            std::string key = cols[0];
+            std::string val = cols[1] + ":" + cols[2];
+            r.dispatch[key] = val;
+        } else {
+            r.dispatch[seg] = seg + ":443";
+        }
+    }
+    return r;
+}
+
+std::string TlsAddrs::find(const std::string& sni, bool authed) const {
+    auto it = dispatch.find(sni);
+    if (it != dispatch.end()) return it->second;
+    if (wildcard == WildcardSNI::All || (wildcard == WildcardSNI::Authed && authed))
+        return sni + ":443";
+    return fallback;
+}
+
+// ===== Global state =====
+std::atomic<bool> g_running{true};
+std::map<int, Conn*> g_conns;
+std::mutex g_conns_mutex;
+
+// ===== Socket helpers =====
+int create_socket(bool v6) {
+    int fd = socket(v6 ? AF_INET6 : AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (fd < 0) { perror("socket"); return -1; }
+    if (v6) { int opt = 0; setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt)); }
+    return fd;
+}
+void set_nodelay(int fd) { int o=1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &o, sizeof(o)); }
+void set_reuseaddr(int fd) { int o=1; setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &o, sizeof(o)); }
+void set_keepalive(int fd) {
+    int o=1; setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &o, sizeof(o));
+    int idle=KEEPALIVE_IDLE; setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    int intvl=KEEPALIVE_INTVL; setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    int cnt=KEEPALIVE_CNT; setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+}
+void set_fastopen_connect(int fd) { int o=1; setsockopt(fd, IPPROTO_TCP, TCP_FASTOPEN_CONNECT, &o, sizeof(o)); }
+
+bool resolve(const std::string& host, int port, sockaddr_storage& addr, socklen_t& alen) {
+    addrinfo hints{}, *res;
+    hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_STREAM;
+    char ps[16]; snprintf(ps, sizeof(ps), "%d", port);
+    if (getaddrinfo(host.c_str(), ps, &hints, &res)) return false;
+    memcpy(&addr, res->ai_addr, res->ai_addrlen);
+    alen = res->ai_addrlen; freeaddrinfo(res); return true;
+}
+
+void resolve_async(const std::string& host, int port,
+                   sockaddr_storage* out_addr, socklen_t* out_alen,
+                   std::atomic<bool>* done, std::atomic<bool>* ok) {
+    std::thread([=]() {
+        bool r = resolve(host, port, *out_addr, *out_alen);
+        *ok = r; *done = true;
+    }).detach();
+}
+
+// ===== TLS record parsing =====
+std::string extract_sni(const uint8_t* frame, size_t len) {
+    if (len < TLS_HEADER_SIZE + 1) return "";
+    if (frame[0] != HANDSHAKE || frame[TLS_HEADER_SIZE] != CLIENT_HELLO) return "";
+    if (len < SESSION_ID_LEN_IDX + 1) return "";
+    uint8_t sid_len = frame[SESSION_ID_LEN_IDX];
+    size_t pos = SESSION_ID_LEN_IDX + 1 + sid_len;
+    if (pos + 10 > len) return "";
+    pos += 10; // ciphers(8) + comp(2)
+    if (pos + 2 > len) return "";
+    uint16_t ext_len = read_u16(frame + pos);
+    pos += 2;
+    size_t ext_end = pos + ext_len;
+    if (ext_end > len) return "";
+    for (; pos + 4 <= ext_end; ) {
+        uint16_t etype = read_u16(frame + pos);
+        uint16_t elen  = read_u16(frame + pos + 2);
+        pos += 4;
+        if (pos + elen > ext_end) return "";
+        if (etype == SNI_EXT_TYPE && elen >= 6 && frame[pos+2] == 0) {
+            uint16_t sni_len = read_u16(frame + pos + 3);
+            if (pos + 5 + sni_len <= ext_end)
+                return std::string((const char*)frame + pos + 5, sni_len);
+        }
+        pos += elen;
+    }
+    return "";
+}
+
+bool extract_server_random(const uint8_t* frame, size_t len, uint8_t* out_random) {
+    size_t min_len = TLS_HEADER_SIZE + 1 + 3 + 2 + TLS_RANDOM_SIZE;
+    if (len < min_len) return false;
+    if (frame[0] != HANDSHAKE) return false;
+    if (frame[TLS_HEADER_SIZE] != SERVER_HELLO) return false;
+    memcpy(out_random, frame + SERVER_RANDOM_IDX, TLS_RANDOM_SIZE);
+    return true;
+}
+
+// ===== Client Hello builder =====
+std::vector<uint8_t> build_client_hello(const std::string& sni,
+                                         const std::vector<std::string>& alpn_list) {
+    uint8_t random[32]; random_bytes(random, 32);
+    uint8_t sid[32];    random_bytes(sid, 32);
+
+    uint8_t ciphers[] = { 0x00, 0x06, 0xC0, 0x2F, 0xC0, 0x30, 0x00, 0x2F };
+    uint8_t comp[] = {1, 0};
+
+    std::vector<uint8_t> sni_ext;
+    uint16_t sl = (uint16_t)sni.size();
+    sni_ext.resize(9 + sl);
+    write_u16(sni_ext.data(), SNI_EXT_TYPE);
+    write_u16(sni_ext.data()+2, (uint16_t)(sl+5));
+    write_u16(sni_ext.data()+4, (uint16_t)(sl+3));
+    sni_ext[6] = 0;
+    write_u16(sni_ext.data()+7, sl);
+    memcpy(sni_ext.data()+9, sni.data(), sl);
+
+    std::vector<uint8_t> alpn_ext;
+    if (!alpn_list.empty()) {
+        alpn_ext.push_back(0); alpn_ext.push_back(16);
+        uint16_t alpn_total = 0;
+        for (auto& p : alpn_list) alpn_total += (uint16_t)(1 + p.size());
+        alpn_ext.push_back((uint8_t)(alpn_total >> 8));
+        alpn_ext.push_back((uint8_t)alpn_total);
+        alpn_ext.push_back((uint8_t)(alpn_total >> 8));
+        alpn_ext.push_back((uint8_t)alpn_total);
+        for (auto& p : alpn_list) {
+            alpn_ext.push_back((uint8_t)p.size());
+            alpn_ext.insert(alpn_ext.end(), (uint8_t*)p.data(), (uint8_t*)p.data() + p.size());
+        }
+    }
+    uint16_t ext_total = (uint16_t)(sni_ext.size() + alpn_ext.size());
+
+    std::vector<uint8_t> body;
+    body.push_back(CLIENT_HELLO);
+    body.push_back(0); body.push_back(0); body.push_back(0);
+    body.push_back(TLS_MAJOR); body.push_back(TLS_MINOR_MIN);
+    body.insert(body.end(), random, random+32);
+    body.push_back(32); body.insert(body.end(), sid, sid+32);
+    body.insert(body.end(), ciphers, ciphers+sizeof(ciphers));
+    body.insert(body.end(), comp, comp+2);
+    body.push_back((uint8_t)(ext_total>>8)); body.push_back((uint8_t)ext_total);
+    body.insert(body.end(), sni_ext.begin(), sni_ext.end());
+    body.insert(body.end(), alpn_ext.begin(), alpn_ext.end());
+    uint32_t hslen = (uint32_t)(body.size()-4);
+    write_u24(body.data()+1, hslen);
+
+    uint16_t reclen = (uint16_t)body.size();
+    std::vector<uint8_t> frame;
+    frame.push_back(HANDSHAKE); frame.push_back(TLS_MAJOR); frame.push_back(TLS_MINOR_MIN);
+    frame.push_back((uint8_t)(reclen>>8)); frame.push_back((uint8_t)reclen);
+    frame.insert(frame.end(), body.begin(), body.end());
+    return frame;
+}
+
+// ===== V3 ClientHello =====
+static constexpr size_t V3_HMAC_IDX = SESSION_ID_LEN_IDX + 1 + TLS_SESSION_ID_SIZE - HMAC_SIZE;
+static constexpr uint8_t V3_ZERO4B[HMAC_SIZE] = {0,0,0,0};
+
+std::vector<uint8_t> build_client_hello_v3(const std::string& sni, const std::string& password,
+                                            const std::vector<std::string>& alpn_list) {
+    auto frame = build_client_hello(sni, alpn_list);
+    if (frame.size() <= V3_HMAC_IDX + HMAC_SIZE) return frame;
+    HmacCtx h; h.init((const uint8_t*)password.data(), password.size());
+    h.update(frame.data() + TLS_HEADER_SIZE, V3_HMAC_IDX - TLS_HEADER_SIZE);
+    h.update(V3_ZERO4B, HMAC_SIZE);
+    h.update(frame.data() + V3_HMAC_IDX + HMAC_SIZE, frame.size() - V3_HMAC_IDX - HMAC_SIZE);
+    uint8_t hmac_val[HMAC_SIZE]; h.finalize(hmac_val, HMAC_SIZE);
+    memcpy(frame.data() + V3_HMAC_IDX, hmac_val, HMAC_SIZE);
+    return frame;
+}
+
+std::vector<uint8_t> build_server_hello(const uint8_t* client_random,
+                                         const uint8_t* session_id, uint8_t sid_len) {
+    uint8_t server_random[32]; random_bytes(server_random, 32);
+    uint8_t cipher[2] = {0x00, 0x2f};
+    uint8_t comp = 0;
+    std::vector<uint8_t> body;
+    body.push_back(SERVER_HELLO);
+    body.push_back(0); body.push_back(0); body.push_back(0);
+    body.push_back(TLS_MAJOR); body.push_back(TLS_MINOR_MIN);
+    body.insert(body.end(), server_random, server_random+32);
+    body.push_back(sid_len);
+    if (sid_len > 0) body.insert(body.end(), session_id, session_id+sid_len);
+    body.insert(body.end(), cipher, cipher+2);
+    body.push_back(comp);
+    uint16_t ext_len = 0;
+    body.push_back((uint8_t)(ext_len>>8)); body.push_back((uint8_t)ext_len);
+    uint32_t hslen = (uint32_t)(body.size()-4);
+    write_u24(body.data()+1, hslen);
+    uint16_t reclen = (uint16_t)body.size();
+    std::vector<uint8_t> rec;
+    rec.push_back(HANDSHAKE); rec.push_back(TLS_MAJOR); rec.push_back(TLS_MINOR_MIN);
+    rec.push_back((uint8_t)(reclen>>8)); rec.push_back((uint8_t)reclen);
+    rec.insert(rec.end(), body.begin(), body.end());
+    return rec;
+}
+
+// ===== V2 first-appdata auth =====
+void build_first_appdata(const uint8_t* data, size_t len, HmacCtx& hs_hmac,
+                          std::vector<uint8_t>& out) {
+    uint8_t hmac_val[HMAC_SIZE_V2];
+    hs_hmac.finalize(hmac_val, HMAC_SIZE_V2);
+    out.resize(TLS_HEADER_SIZE + HMAC_SIZE_V2 + len);
+    out[0] = APPLICATION_DATA; out[1] = TLS_MAJOR; out[2] = TLS_MINOR_MIN;
+    write_u16(out.data() + 3, (uint16_t)(HMAC_SIZE_V2 + len));
+    memcpy(out.data() + TLS_HEADER_SIZE, hmac_val, HMAC_SIZE_V2);
+    memcpy(out.data() + TLS_HEADER_SIZE + HMAC_SIZE_V2, data, len);
+}
+
+bool verify_first_appdata(const uint8_t* frame, size_t len, HmacCtx& hs_hmac,
+                           std::vector<uint8_t>& payload) {
+    if (len < TLS_HEADER_SIZE + HMAC_SIZE_V2) return false;
+    if (frame[0] != APPLICATION_DATA) return false;
+    if (frame[1] != TLS_MAJOR || frame[2] != TLS_MINOR_MIN) return false;
+    uint8_t expected[HMAC_SIZE_V2];
+    hs_hmac.finalize(expected, HMAC_SIZE_V2);
+    if (memcmp(frame + TLS_HEADER_SIZE, expected, HMAC_SIZE_V2) != 0) return false;
+    size_t plen = len - TLS_HEADER_SIZE - HMAC_SIZE_V2;
+    payload.resize(plen);
+    memcpy(payload.data(), frame + TLS_HEADER_SIZE + HMAC_SIZE_V2, plen);
+    return true;
+}
+
+// ===== V3 protocol functions =====
+bool validate_client_hello_v3(const uint8_t* frame, size_t len,
+                               const std::string& password, std::string& out_sni) {
+    if (len <= V3_HMAC_IDX + HMAC_SIZE) return false;
+    if (frame[0] != HANDSHAKE || frame[TLS_HEADER_SIZE] != CLIENT_HELLO) return false;
+    out_sni = extract_sni(frame, len);
+    uint8_t received[HMAC_SIZE]; memcpy(received, frame + V3_HMAC_IDX, HMAC_SIZE);
+    HmacCtx h; h.init((const uint8_t*)password.data(), password.size());
+    h.update(frame + TLS_HEADER_SIZE, V3_HMAC_IDX - TLS_HEADER_SIZE);
+    h.update(V3_ZERO4B, HMAC_SIZE);
+    h.update(frame + V3_HMAC_IDX + HMAC_SIZE, len - V3_HMAC_IDX - HMAC_SIZE);
+    uint8_t expected[HMAC_SIZE]; h.finalize(expected, HMAC_SIZE);
+    return memcmp(received, expected, HMAC_SIZE) == 0;
+}
+
+bool detect_tls13(const uint8_t* frame, size_t len) { return support_tls13(frame, len); }
+
+void build_fake_request(std::vector<uint8_t>& out) {
+    const char* req = "GET / HTTP/1.1\r\nHost: cloud.tencent.com\r\n"
+                      "User-Agent: Mozilla/5.0\r\nAccept: */*\r\n\r\n";
+    size_t rlen = strlen(req);
+    out.resize(TLS_HEADER_SIZE + HMAC_SIZE + rlen);
+    out[0] = APPLICATION_DATA; out[1] = TLS_MAJOR; out[2] = TLS_MINOR_MIN;
+    write_u16(out.data() + 3, (uint16_t)(HMAC_SIZE + rlen));
+    random_bytes(out.data() + TLS_HEADER_SIZE, HMAC_SIZE);
+    memcpy(out.data() + TLS_HEADER_SIZE + HMAC_SIZE, req, rlen);
+}
+
+void v3_xor_data(uint8_t* data, size_t len, const std::vector<uint8_t>& xor_key) {
+    for (size_t i = 0; i < len; i++) data[i] ^= xor_key[i % xor_key.size()];
+}
+
+void v3_build_appdata(const uint8_t* plain, size_t len, const std::vector<uint8_t>& xor_key,
+                       HmacCtx& hmac, std::vector<uint8_t>& out) {
+    std::vector<uint8_t> xored(plain, plain + len);
+    v3_xor_data(xored.data(), len, xor_key);
+    hmac.update(xored.data(), len);
+    uint8_t hmac_val[HMAC_SIZE]; hmac.finalize(hmac_val, HMAC_SIZE);
+    hmac.update(hmac_val, HMAC_SIZE);
+    out.resize(TLS_HEADER_SIZE + HMAC_SIZE + len);
+    out[0] = APPLICATION_DATA; out[1] = TLS_MAJOR; out[2] = TLS_MINOR_MIN;
+    write_u16(out.data() + 3, (uint16_t)(HMAC_SIZE + len));
+    memcpy(out.data() + TLS_HEADER_SIZE, hmac_val, HMAC_SIZE);
+    memcpy(out.data() + TLS_HEADER_SIZE + HMAC_SIZE, xored.data(), len);
+}
+
+bool v3_verify_appdata(const uint8_t* frame, size_t flen, const std::vector<uint8_t>& xor_key,
+                        HmacCtx& hmac, std::vector<uint8_t>& payload) {
+    if (flen < TLS_HMAC_HEADER_SIZE) return false;
+    if (frame[0] != APPLICATION_DATA) return false;
+    if (frame[1] != TLS_MAJOR || frame[2] != TLS_MINOR_MIN) return false;
+    size_t data_len = flen - TLS_HMAC_HEADER_SIZE;
+    const uint8_t* data = frame + TLS_HMAC_HEADER_SIZE;
+    hmac.update(data, data_len);
+    uint8_t expected[HMAC_SIZE]; hmac.finalize(expected, HMAC_SIZE);
+    if (memcmp(frame + TLS_HEADER_SIZE, expected, HMAC_SIZE) != 0) return false;
+    hmac.update(expected, HMAC_SIZE);
+    payload.resize(data_len);
+    memcpy(payload.data(), data, data_len);
+    v3_xor_data(payload.data(), data_len, xor_key);
+    return true;
+}
+
+// ===== HMAC setup =====
+void setup_hmac_from_random(Conn* c, const uint8_t* server_random, bool is_server) {
+    auto key = kdf(c->password, server_random, 32);
+    if (is_server) {
+        uint8_t l1[] = "S"; c->hmac_add.init(key.data(), key.size()); c->hmac_add.update(l1, 1);
+        uint8_t l2[] = "C"; c->hmac_verify.init(key.data(), key.size()); c->hmac_verify.update(l2, 1);
+    } else {
+        uint8_t l1[] = "C"; c->hmac_add.init(key.data(), key.size()); c->hmac_add.update(l1, 1);
+        uint8_t l2[] = "S"; c->hmac_verify.init(key.data(), key.size()); c->hmac_verify.update(l2, 1);
+    }
+    c->v3_xor_key = kdf(c->password, server_random, 32);
+}
+
+// ===== Event loop =====
+EventLoop::EventLoop(const Config& c) : cfg_(c) {
+    epfd_ = epoll_create1(0);
+    if (epfd_ < 0) { perror("epoll_create"); epfd_ = -1; }
+}
+EventLoop::~EventLoop() { if (epfd_ >= 0) close(epfd_); }
+
+void EventLoop::set_listener(int fd) {
+    listener_ = fd;
+    epoll_event e{}; e.events = EPOLLIN; e.data.fd = fd;
+    epoll_ctl(epfd_, EPOLL_CTL_ADD, fd, &e);
+}
+
+void EventLoop::add_fd(int fd, uint32_t ev, Conn* c) {
+    std::lock_guard<std::mutex> lk(g_conns_mutex);
+    g_conns[fd] = c;
+    epoll_event e{}; e.events = ev; e.data.fd = fd;
+    epoll_ctl(epfd_, EPOLL_CTL_ADD, fd, &e);
+}
+void EventLoop::mod_fd(int fd, uint32_t ev) {
+    epoll_event e{}; e.events = ev; e.data.fd = fd;
+    epoll_ctl(epfd_, EPOLL_CTL_MOD, fd, &e);
+}
+void EventLoop::del_fd(int fd) {
+    case HsPhase::ServerWaitTlsHello: {
+        auto peer_it = g_conns.find(c->peer_fd);
+    if (it != g_conns.end()) { it->second->fd = -1; g_conns.erase(it); }
+}
+
+void EventLoop::run() {
+    std::array<epoll_event, EPOLL_MAX_EVENTS> events;
+    while (g_running) {
+        int n = epoll_wait(epfd_, events.data(), events.size(), 1000);
+        for (int i = 0; i < n; i++) {
+            int fd = events[i].data.fd;
+    case HsPhase::ServerWaitTlsHello: {
+        auto peer_it = g_conns.find(c->peer_fd);
+            if (it == g_conns.end()) continue;
+            Conn* c = it->second;
+            uint32_t ev = events[i].events;
+            if (ev & (EPOLLERR | EPOLLHUP)) { close_conn(c); continue; }
+            if (ev & EPOLLIN)  handle_read(c);
+            if (ev & EPOLLOUT) handle_write(c);
+        }
+    }
+}
+
+void EventLoop::accept_conn() {
+    while (true) {
+        sockaddr_storage addr; socklen_t alen = sizeof(addr);
+        int fd = accept4(listener_, (sockaddr*)&addr, &alen, SOCK_NONBLOCK);
+        if (fd < 0) { if (errno != EAGAIN && errno != EWOULDBLOCK) perror("accept"); break; }
+        set_nodelay(fd);
+        set_keepalive(fd);
+
+        Conn* local = new Conn{};
+        local->fd = fd;
+        local->is_tls_side = false;
+        local->accepted_from_listener = true;
+        local->password = cfg_.password;
+
+        if (cfg_.server_mode) {
+            local->hs_phase = HsPhase::ServerReadHello;
+            local->is_tls_side = true;
+            add_fd(fd, EPOLLIN, local);
+            LOG(LogLevel::INFO, "Server: accepted client fd=%d", fd);
+        } else {
+            std::string shost; int sport;
+            parse_addr(cfg_.target_addr, shost, sport);
+            sockaddr_storage sa; socklen_t sl;
+            if (!resolve(shost, sport, sa, sl)) {
+                LOG(LogLevel::ERROR, "Client: failed to resolve %s", cfg_.target_addr.c_str());
+                close(fd); delete local; continue;
+            }
+            int rfd = create_socket(sa.ss_family == AF_INET6);
+            if (rfd < 0) { close(fd); delete local; continue; }
+            set_nodelay(rfd); set_keepalive(rfd);
+            if (cfg_.fastopen) set_fastopen_connect(rfd);
+            int ret = connect(rfd, (sockaddr*)&sa, sl);
+            if (ret < 0 && errno != EINPROGRESS) {
+                LOG(LogLevel::ERROR, "Client: connect failed");
+                close(fd); close(rfd); delete local; continue;
+            }
+            Conn* remote = new Conn{};
+            remote->fd = rfd; remote->peer_fd = fd;
+            remote->is_tls_side = true;
+            remote->hs_phase = HsPhase::ClientTlsHandshake;
+            remote->password = cfg_.password;
+            local->peer_fd = rfd;
+            local->hs_phase = HsPhase::ClientWaitHello;
+            add_fd(rfd, EPOLLOUT, remote);
+            add_fd(fd, EPOLLIN, local);
+            LOG(LogLevel::INFO, "Client: accepted local fd=%d connecting to %s:%d fd=%d",
+                fd, shost.c_str(), sport, rfd);
+        }
+    }
+}
+
+void EventLoop::handle_read(Conn* c) {
+    uint8_t buf[IO_BUF_SIZE];
+    ssize_t n = recv(c->fd, buf, sizeof(buf), 0);
+    if (n <= 0) { LOG(LogLevel::DEBUG, "Closing fd=%d (recv=%zd)", c->fd, n); close_conn(c); return; }
+
+    if (!c->handshake_done) {
+        if (c->hs_phase == HsPhase::ClientTlsHandshake) {
+            client_tls_io(c, true, true);
+            return;
+        }
+        handle_read_handshake(c, buf, (size_t)n);
+        return;
+    }
+
+    if (c->is_tls_side) {
+        c->frame_decoder.feed(buf, (size_t)n);
+        size_t flen; const uint8_t* frame;
+        while ((frame = c->frame_decoder.next_frame(flen)) != nullptr) {
+            if (frame[0] == ALERT) { close_conn(c); return; }
+            if (frame[0] == APPLICATION_DATA) {
+                auto peer_it = g_conns.find(c->peer_fd);
+                if (peer_it == g_conns.end()) { close_conn(c); return; }
+                Conn* raw = peer_it->second;
+
+                if (c->v3_mode) {
+                    std::vector<uint8_t> payload;
+                    if (v3_verify_appdata(frame, flen, c->v3_xor_key, c->hmac_verify, payload)) {
+                        raw->outbuf.insert(raw->outbuf.end(), payload.begin(), payload.end());
+                        mod_fd(raw->fd, EPOLLIN | EPOLLOUT);
+                    } else {
+                        LOG(LogLevel::ERROR, "V3 HMAC verification failed! Closing.");
+                        close_conn(c); return;
+                    }
+                } else if (!c->first_appdata_checked) {
+                    std::vector<uint8_t> payload;
+                    if (verify_first_appdata(frame, flen, c->handshake_hmac, payload)) {
+                        c->first_appdata_checked = true;
+                        if (!payload.empty()) {
+                            raw->outbuf.insert(raw->outbuf.end(), payload.begin(), payload.end());
+                            mod_fd(raw->fd, EPOLLIN | EPOLLOUT);
+                        }
+                        LOG(LogLevel::INFO, "Server: first appdata verified, switching to data relay");
+                        c->frame_decoder.consume(flen);
+                        continue;
+                    } else {
+                        LOG(LogLevel::ERROR, "Server: first appdata HMAC mismatch! Closing.");
+                        close_conn(c); return;
+                    }
+                }
+                if (!c->first_appdata_checked) { c->frame_decoder.consume(flen); continue; }
+
+                if (c->hmac_ignore_active) {
+                    std::vector<uint8_t> payload;
+                    if (verify_appdata_record(frame, flen, c->hmac_ignore, false, payload)) {
+                        c->frame_decoder.consume(flen); continue;
+                    }
+                    c->hmac_ignore_active = false;
+                }
+                std::vector<uint8_t> payload;
+                if (verify_appdata_record(frame, flen, c->hmac_verify, true, payload)) {
+                    raw->outbuf.insert(raw->outbuf.end(), payload.begin(), payload.end());
+                    mod_fd(raw->fd, EPOLLIN | EPOLLOUT);
+                } else {
+                    LOG(LogLevel::ERROR, "HMAC verification failed! Closing.");
+                    close_conn(c); return;
+                }
+            }
+            c->frame_decoder.consume(flen);
+        }
+        c->frame_decoder.compact();
+    } else {
+        auto peer_it = g_conns.find(c->peer_fd);
+        if (peer_it != g_conns.end()) {
+            Conn* tls = peer_it->second;
+            std::vector<uint8_t> wrapped;
+            if (tls->v3_mode) {
+                v3_build_appdata(buf, (size_t)n, tls->v3_xor_key, tls->hmac_add, wrapped);
+            } else if (!tls->first_appdata_sent) {
+                build_first_appdata(buf, (size_t)n, tls->handshake_hmac, wrapped);
+                tls->first_appdata_sent = true;
+            } else {
+                build_appdata_record(buf, (size_t)n, tls->hmac_add, wrapped);
+            }
+            tls->outbuf.insert(tls->outbuf.end(), wrapped.begin(), wrapped.end());
+            mod_fd(tls->fd, EPOLLIN | EPOLLOUT);
+        }
+    }
+}
+
+void EventLoop::handle_write(Conn* c) {
+    if (!c->handshake_done && c->hs_phase == HsPhase::ClientTlsHandshake && !c->ssl) {
+        client_init_tls(c);
+    }
+    if (!c->handshake_done && c->hs_phase == HsPhase::ClientTlsHandshake && c->ssl) {
+        client_tls_io(c, false, true); return;
+    }
+
+    if (c->outbuf.empty()) {
+        if (!c->handshake_done) {
+            if (c->hs_phase == HsPhase::ClientSendHello) {
+                c->hs_phase = HsPhase::ClientWaitHello;
+                LOG(LogLevel::DEBUG, "Client: ClientHello sent");
+            } else if (c->hs_phase == HsPhase::ServerForwardHello) {
+                c->hs_phase = HsPhase::ServerBidirRelay;
+                auto peer_it = g_conns.find(c->peer_fd);
+                if (peer_it != g_conns.end()) peer_it->second->hs_phase = HsPhase::ServerBidirRelay;
+                LOG(LogLevel::INFO, "Server: ClientHello forwarded, entering bidirectional relay");
+            } else if (c->hs_phase == HsPhase::ServerConnectData) {
+                c->handshake_done = true; c->hs_phase = HsPhase::Done;
+                auto peer_it = g_conns.find(c->peer_fd);
+                if (peer_it != g_conns.end()) {
+                    Conn* raw = peer_it->second;
+                    raw->handshake_done = true; raw->hs_phase = HsPhase::Done;
+                    if (!raw->inbuf.empty()) {
+                        std::vector<uint8_t> wrapped;
+                        build_first_appdata(raw->inbuf.data(), raw->inbuf.size(), c->handshake_hmac, wrapped);
+                        c->first_appdata_sent = true;
+                        c->outbuf.insert(c->outbuf.end(), wrapped.begin(), wrapped.end());
+                        mod_fd(c->fd, EPOLLIN | EPOLLOUT);
+                        raw->inbuf.clear();
+                    }
+                }
+                LOG(LogLevel::INFO, "Server: data connection established, entering HMAC relay mode");
+            }
+        }
+        mod_fd(c->fd, EPOLLIN); return;
+    }
+    ssize_t n = send(c->fd, c->outbuf.data(), c->outbuf.size(), MSG_NOSIGNAL);
+    if (n < 0) { if (errno != EAGAIN && errno != EWOULDBLOCK) close_conn(c); return; }
+    c->outbuf.erase(c->outbuf.begin(), c->outbuf.begin() + n);
+}
+
+void EventLoop::close_conn(Conn* c) {
+    LOG(LogLevel::DEBUG, "Closing fd=%d", c->fd);
+    if (c->fd >= 0) shutdown(c->fd, SHUT_WR);
+                        LOG(LogLevel::INFO, "Server: HMAC match! Switching to data relay.");
+                        {
+                            auto peer2 = g_conns.find(c->peer_fd);
+            auto it = g_conns.find(c->peer_fd);
+            if (it != g_conns.end()) shutdown(it->second->fd, SHUT_WR);
+        }
+    }
+                        LOG(LogLevel::INFO, "Server: HMAC match! Switching to data relay.");
+                        {
+                            auto peer2 = g_conns.find(c->peer_fd);
+            auto it = g_conns.find(c->peer_fd);
+            if (it != g_conns.end()) del_fd(c->peer_fd);
+        }
+    }
+                        LOG(LogLevel::INFO, "Server: HMAC match! Switching to data relay.");
+                        {
+                            auto peer2 = g_conns.find(c->peer_fd);
+            close(c->peer_fd);
+    }
+    delete c;
+}
+
+// ===== Handshake protocol =====
+void EventLoop::handle_read_handshake(Conn* c, const uint8_t* data, size_t len) {
+    switch (c->hs_phase) {
+    case HsPhase::ClientSendHello: case HsPhase::ClientTlsHandshake:
+        c->inbuf.insert(c->inbuf.end(), data, data + len); break;
+    case HsPhase::ClientWaitHello:
+        if (c->is_tls_side) {
+            c->inbuf.insert(c->inbuf.end(), data, data + len);
+            if (c->inbuf.size() >= TLS_HEADER_SIZE) {
+                uint16_t reclen = read_u16(c->inbuf.data() + 3);
+                size_t total = TLS_HEADER_SIZE + reclen;
+                if (c->inbuf.size() >= total) {
+                    uint8_t sr[TLS_RANDOM_SIZE];
+                    if (extract_server_random(c->inbuf.data(), total, sr)) {
+                        client_got_server_hello(c, c->inbuf.data(), total, sr);
+                        c->inbuf.clear();
+                    } else {
+                        auto peer_it = g_conns.find(c->peer_fd);
+                        if (peer_it != g_conns.end()) {
+                            peer_it->second->outbuf.insert(peer_it->second->outbuf.end(),
+                                c->inbuf.begin(), c->inbuf.end());
+                            mod_fd(peer_it->second->fd, EPOLLIN | EPOLLOUT);
+                        }
+                        c->inbuf.clear();
+                    }
+                }
+            }
+        } else { c->inbuf.insert(c->inbuf.end(), data, data + len); }
+        break;
+    case HsPhase::ServerReadHello:
+        c->inbuf.insert(c->inbuf.end(), data, data + len);
+        if (c->inbuf.size() >= TLS_HEADER_SIZE) {
+            uint16_t reclen = read_u16(c->inbuf.data() + 3);
+            size_t total = TLS_HEADER_SIZE + reclen;
+            if (c->inbuf.size() >= total) {
+                server_process_hello(c, c->inbuf.data(), total);
+                c->inbuf.clear();
+            }
+        }
+        break;
+    case HsPhase::ServerForwardHello: {
+        auto peer_it = g_conns.find(c->peer_fd);
+        if (peer_it != g_conns.end()) {
+            Conn* client_conn = peer_it->second;
+            c->inbuf.insert(c->inbuf.end(), data, data + len);
+            if (c->inbuf.size() >= TLS_HEADER_SIZE) {
+                uint16_t rl = read_u16(c->inbuf.data() + 3);
+                size_t total = TLS_HEADER_SIZE + rl;
+                if (c->inbuf.size() >= total) {
+                    uint8_t sr[TLS_RANDOM_SIZE];
+                    if (extract_server_random(c->inbuf.data(), total, sr)) {
+                        LOG(LogLevel::INFO, "Server: got ServerHello from TLS endpoint");
+                        client_conn->outbuf.insert(client_conn->outbuf.end(),
+                            c->inbuf.begin(), c->inbuf.end());
+                        mod_fd(client_conn->fd, EPOLLIN | EPOLLOUT);
+                        close_conn(c);
+                        connect_to_data_target(client_conn, sr);
+                        return;
+                    }
+                    client_conn->outbuf.insert(client_conn->outbuf.end(),
+                        c->inbuf.begin(), c->inbuf.end());
+                    mod_fd(client_conn->fd, EPOLLIN | EPOLLOUT);
+                    c->inbuf.clear();
+                }
+            }
+        }
+        break;
+    }
+    case HsPhase::ServerBidirRelay:
+        if (!c->accepted_from_listener) {
+            auto peer_it = g_conns.find(c->peer_fd);
+            if (peer_it != g_conns.end()) {
+                Conn* client_conn = peer_it->second;
+                if (!client_conn->handshake_done) {
+                    c->inbuf.insert(c->inbuf.end(), data, data + len);
+                    if (c->inbuf.size() >= TLS_HEADER_SIZE) {
+                        uint16_t rl = read_u16(c->inbuf.data() + 3);
+                        size_t total = TLS_HEADER_SIZE + rl;
+                        if (c->inbuf.size() >= total) {
+                            uint8_t sr[TLS_RANDOM_SIZE];
+                            if (extract_server_random(c->inbuf.data(), total, sr)) {
+                                memcpy(client_conn->server_random, sr, TLS_RANDOM_SIZE);
+                                if (cfg_.v3 == V3Mode::Strict && !detect_tls13(c->inbuf.data(), total)) {
+                                    LOG(LogLevel::WARN, "Server: V3 strict: TLS 1.3 not supported, sending fake request");
+                                    std::vector<uint8_t> fake; build_fake_request(fake);
+                                    client_conn->outbuf.insert(client_conn->outbuf.end(),
+                                        c->inbuf.begin(), c->inbuf.end());
+                                    client_conn->outbuf.insert(client_conn->outbuf.end(),
+                                        fake.begin(), fake.end());
+                                    mod_fd(client_conn->fd, EPOLLIN | EPOLLOUT);
+                                    close_conn(c); c->inbuf.clear(); return;
+                                }
+                                LOG(LogLevel::INFO, "Server: extracted server_random from TLS ServerHello");
+                            }
+                            c->inbuf.clear();
+                        }
+                    }
+                }
+                client_conn->outbuf.insert(client_conn->outbuf.end(), data, data + len);
+                mod_fd(client_conn->fd, EPOLLIN | EPOLLOUT);
+            }
+        } else if (c->direct_proxy) {
+            auto peer_it = g_conns.find(c->peer_fd);
+            if (peer_it != g_conns.end()) {
+                peer_it->second->outbuf.insert(peer_it->second->outbuf.end(), data, data + len);
+                mod_fd(peer_it->second->fd, EPOLLIN | EPOLLOUT);
+            }
+        } else {
+            c->handshake_hmac.update(data, len);
+            {
+                auto peer_it = g_conns.find(c->peer_fd);
+                    peer_it->second->outbuf.insert(peer_it->second->outbuf.end(), data, data + len);
+                    mod_fd(peer_it->second->fd, EPOLLIN | EPOLLOUT);
+                }
+            }
+            c->frame_decoder.feed(data, len);
+            size_t flen; const uint8_t* frame;
+            while ((frame = c->frame_decoder.next_frame(flen)) != nullptr) {
+                uint8_t rtype = frame[0];
+                bool valid_ver = (frame[1] == TLS_MAJOR && (frame[2] == TLS_MINOR_MIN || frame[2] == TLS_MINOR_MAJ));
+                if (!c->seen_handshake && rtype != HANDSHAKE) {
+                    LOG(LogLevel::WARN, "Server: first packet not HANDSHAKE, DirectProxy");
+                    c->direct_proxy = true; c->frame_decoder.consume(flen); continue;
+                }
+                if (!valid_ver) {
+                    LOG(LogLevel::WARN, "Server: invalid TLS version, DirectProxy");
+                    c->direct_proxy = true; c->frame_decoder.consume(flen); continue;
+                }
+                if (rtype == HANDSHAKE) c->seen_handshake = true;
+                if (rtype == CHANGE_CIPHER_SPEC) c->seen_ccs = true;
+                if (rtype == APPLICATION_DATA && c->seen_handshake && c->seen_ccs
+                    && flen >= TLS_HEADER_SIZE + HMAC_SIZE_V2) {
+                    uint8_t cur_hmac[HMAC_SIZE_V2];
+                    c->handshake_hmac.finalize(cur_hmac, HMAC_SIZE_V2);
+                    memcpy(c->hmac_ring[c->hmac_ring_pos], cur_hmac, HMAC_SIZE_V2);
+                    c->hmac_ring_pos = (c->hmac_ring_pos + 1) % 10;
+                    if (c->hmac_ring_count < 10) c->hmac_ring_count++;
+                    bool found = false;
+                    for (int i = 0; i < c->hmac_ring_count; i++)
+                        if (memcmp(frame + TLS_HEADER_SIZE, c->hmac_ring[i], HMAC_SIZE_V2) == 0)
+                            { found = true; break; }
+        } else {
+            c->handshake_hmac.update(data, len);
+            {
+                auto peer_it = g_conns.find(c->peer_fd);
+                            if (peer2 != g_conns.end()) close_conn(peer2->second);
+                        }
+                        c->peer_fd = -1; c->first_appdata_checked = true;
+                        size_t plen = flen - TLS_HEADER_SIZE - HMAC_SIZE_V2;
+                        std::vector<uint8_t> pure(frame + TLS_HEADER_SIZE + HMAC_SIZE_V2,
+                                                  frame + TLS_HEADER_SIZE + HMAC_SIZE_V2 + plen);
+                        connect_to_data_target(c, c->server_random);
+                        if (!pure.empty()) c->inbuf = std::move(pure);
+                        return;
+                    }
+                    if (++c->appdata_attempts >= 3) {
+                        LOG(LogLevel::WARN, "Server: %d appdata without match, DirectProxy", c->appdata_attempts);
+                        c->direct_proxy = true;
+                    }
+                }
+                c->frame_decoder.consume(flen);
+            }
+            c->frame_decoder.compact();
+        }
+                        LOG(LogLevel::INFO, "Server: HMAC match! Switching to data relay.");
+                        {
+                            auto peer2 = g_conns.find(c->peer_fd);
+        if (peer_it != g_conns.end()) {
+            Conn* client_conn = peer_it->second;
+            c->inbuf.insert(c->inbuf.end(), data, data + len);
+            if (c->inbuf.size() >= TLS_HEADER_SIZE) {
+                uint16_t rl = read_u16(c->inbuf.data() + 3);
+                size_t total = TLS_HEADER_SIZE + rl;
+                if (c->inbuf.size() >= total) {
+                    uint8_t sr[TLS_RANDOM_SIZE];
+                    if (extract_server_random(c->inbuf.data(), total, sr)) {
+                        LOG(LogLevel::INFO, "Server: got ServerHello from TLS endpoint");
+                        client_conn->outbuf.insert(client_conn->outbuf.end(),
+                            c->inbuf.begin(), c->inbuf.end());
+                        mod_fd(client_conn->fd, EPOLLIN | EPOLLOUT);
+                        close_conn(c);
+                        connect_to_data_target(client_conn, sr);
+                        return;
+                    }
+                    client_conn->outbuf.insert(client_conn->outbuf.end(),
+                        c->inbuf.begin(), c->inbuf.end());
+                    mod_fd(client_conn->fd, EPOLLIN | EPOLLOUT);
+                    c->inbuf.clear();
+                }
+            }
+        }
+        break;
+    }
+    case HsPhase::ServerConnectData: case HsPhase::Done: break;
+    }
+}
+
+// ===== Client TLS handshake =====
+void EventLoop::client_init_tls(Conn* remote) {
+    auto ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) { LOG(LogLevel::ERROR, "SSL_CTX_new failed"); close_conn(remote); return; }
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
+    auto ssl = SSL_new(ctx);
+    if (!ssl) { SSL_CTX_free(ctx); close_conn(remote); return; }
+    BIO *bio_in = nullptr, *bio_net = nullptr;
+    if (!BIO_new_bio_pair(&bio_in, 0, &bio_net, 0)) {
+        SSL_free(ssl); SSL_CTX_free(ctx); close_conn(remote); return;
+    }
+    SSL_set_bio(ssl, bio_in, bio_in);
+    std::string sni_host = cfg_.tls_host;
+    size_t col = sni_host.rfind(':');
+    if (col != std::string::npos && col > 0 && sni_host[col-1] != ':')
+        sni_host = sni_host.substr(0, col);
+    SSL_set_tlsext_host_name(ssl, sni_host.c_str());
+    remote->handshake_hmac.init((const uint8_t*)cfg_.password.data(), cfg_.password.size());
+    remote->handshake_hmac_init = true;
+    remote->ssl_ctx = SslCtx(ctx);
+    remote->ssl = SslHandle(ssl);
+    remote->bio_in = BioHandle(bio_in);
+    remote->bio_net = BioHandle(bio_net);
+    SSL_set_connect_state(ssl);
+    SSL_set_mode(ssl, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+    LOG(LogLevel::INFO, "Client: starting TLS handshake SNI=%s", sni_host.c_str());
+    client_tls_io(remote, false, true);
+}
+
+void EventLoop::client_tls_io(Conn* remote, bool can_read, bool can_write) {
+    auto ssl = (SSL*)remote->ssl.ptr;
+    auto bio_net = (BIO*)remote->bio_net.ptr;
+    uint8_t buf[IO_BUF_SIZE];
+    if (can_write) {
+        int n = BIO_read(bio_net, buf, sizeof(buf));
+        while (n > 0) {
+            remote->handshake_hmac.update(buf, n);
+            ssize_t sent = send(remote->fd, buf, n, MSG_NOSIGNAL);
+            if (sent < 0) { if (errno == EAGAIN) break; client_tls_done(remote); return; }
+            if (sent < n) break;
+            n = BIO_read(bio_net, buf, sizeof(buf));
+        }
+    }
+    if (can_read) {
+        ssize_t n = recv(remote->fd, buf, sizeof(buf), 0);
+        if (n > 0) BIO_write(bio_net, buf, n);
+        else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+            client_tls_done(remote); return;
+        }
+    }
+    int ret = SSL_do_handshake(ssl);
+    if (ret == 1) {
+        uint8_t tmp[TLS_RANDOM_SIZE];
+        if (SSL_get_server_random(ssl, tmp, TLS_RANDOM_SIZE) > 0)
+            memcpy(remote->server_random, tmp, TLS_RANDOM_SIZE);
+        else random_bytes(remote->server_random, TLS_RANDOM_SIZE);
+        LOG(LogLevel::INFO, "Client: TLS handshake complete");
+        client_tls_done(remote); return;
+    }
+    int err = SSL_get_error(ssl, ret);
+    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+        mod_fd(remote->fd, EPOLLIN | EPOLLOUT); return;
+    }
+    LOG(LogLevel::ERROR, "Client: TLS handshake failed: %d/%d", ret, err);
+    client_tls_done(remote);
+}
+
+void EventLoop::client_tls_done(Conn* remote) {
+    remote->ssl = SslHandle(); remote->ssl_ctx = SslCtx();
+    remote->bio_net = BioHandle(); remote->bio_in = BioHandle();
+    if (!remote->tls_handshake_done && !remote->handshake_done) {
+        LOG(LogLevel::WARN, "Client: TLS failed, falling back to manual ClientHello");
+        remote->hs_phase = HsPhase::ClientSendHello;
+        remote->outbuf.clear();
+        client_send_hello(remote); return;
+    }
+    remote->tls_handshake_done = true;
+    remote->hs_phase = HsPhase::ClientWaitHello;
+    LOG(LogLevel::INFO, "Client: TLS done, waiting for server relay");
+    mod_fd(remote->fd, EPOLLIN);
+}
+
+void EventLoop::client_send_hello(Conn* remote) {
+    std::vector<std::string> snis;
+    { std::string s = cfg_.tls_host; size_t start=0, end;
+      while ((end=s.find(';',start))!=std::string::npos){auto sni=s.substr(start,end-start);if(!sni.empty())snis.push_back(sni);start=end+1;}
+      auto last=s.substr(start); if(!last.empty())snis.push_back(last); }
+    if (snis.empty()) snis.push_back("cloud.tencent.com");
+    std::string sni_host = snis[std::uniform_int_distribution<size_t>(0, snis.size()-1)(rng())];
+    size_t col=sni_host.rfind(':');
+    if(col!=std::string::npos&&col>0&&sni_host[col-1]!=':') sni_host=sni_host.substr(0,col);
+    auto hello = (cfg_.v3 != V3Mode::Disabled)
+        ? build_client_hello_v3(sni_host, cfg_.password, cfg_.alpn)
+        : build_client_hello(sni_host, cfg_.alpn);
+    remote->handshake_hmac.init((const uint8_t*)cfg_.password.data(), cfg_.password.size());
+    remote->handshake_hmac_init = true;
+    remote->handshake_hmac.update(hello.data(), hello.size());
+    remote->outbuf = std::move(hello);
+    remote->v3_mode = (cfg_.v3 != V3Mode::Disabled);
+    mod_fd(remote->fd, EPOLLIN | EPOLLOUT);
+}
+
+void EventLoop::server_process_hello(Conn* client_conn, const uint8_t* data, size_t len) {
+    client_conn->handshake_hmac.init((const uint8_t*)cfg_.password.data(), cfg_.password.size());
+    client_conn->handshake_hmac_init = true; client_conn->handshake_hmac.update(data, len);
+    client_conn->v3_mode = (cfg_.v3 != V3Mode::Disabled);
+    std::string sni;
+    if (cfg_.v3 != V3Mode::Disabled) {
+        bool ok = validate_client_hello_v3(data, len, cfg_.password, sni);
+        if (!ok && cfg_.v3 == V3Mode::Strict) {
+            LOG(LogLevel::ERROR, "Server: V3 strict HMAC mismatch, closing");
+            close_conn(client_conn); return;
+        }
+        LOG(LogLevel::INFO, "Server: V3 ClientHello validation: %s", ok?"PASS":"FAIL");
+    } else sni = extract_sni(data, len);
+    std::string tls_target = cfg_.tls_addrs.find(sni, true);
+    LOG(LogLevel::INFO, "Server: ClientHello SNI=%s -> TLS=%s", sni.c_str(), tls_target.c_str());
+    std::string thost; int tport;
+    if (!parse_addr(tls_target, thost, tport)) {
+        thost = tls_target; tport = 443;
+        size_t col = thost.rfind(':');
+        if (col != std::string::npos) { tport = atoi(thost.c_str()+col+1); thost = thost.substr(0,col); }
+    }
+    sockaddr_storage tsa; socklen_t tsl;
+    if (!resolve(thost, tport, tsa, tsl)) {
+        LOG(LogLevel::ERROR, "Server: failed to resolve TLS %s", tls_target.c_str());
+        close_conn(client_conn); return;
+    }
+    int tfd = create_socket(tsa.ss_family == AF_INET6);
+    if (tfd < 0) { close_conn(client_conn); return; }
+    set_nodelay(tfd); set_keepalive(tfd);
+    if (cfg_.fastopen) set_fastopen_connect(tfd);
+    if (connect(tfd, (sockaddr*)&tsa, tsl) < 0 && errno != EINPROGRESS) {
+        LOG(LogLevel::ERROR, "Server: connect TLS %s:%d failed: %s", thost.c_str(), tport, strerror(errno));
+        close(tfd); close_conn(client_conn); return;
+    }
+    Conn* tls_conn = new Conn{};
+    tls_conn->fd = tfd; tls_conn->peer_fd = client_conn->fd;
+    tls_conn->is_tls_side = true; tls_conn->hs_phase = HsPhase::ServerForwardHello;
+    tls_conn->password = cfg_.password; client_conn->peer_fd = tfd;
+    tls_conn->outbuf.assign(data, data + len);
+    add_fd(tfd, EPOLLOUT, tls_conn);
+    client_conn->hs_phase = HsPhase::ServerForwardHello;
+    LOG(LogLevel::INFO, "Server: connected TLS %s:%d fd=%d", thost.c_str(), tport, tfd);
+}
+
+                        LOG(LogLevel::INFO, "Server: HMAC match! Switching to data relay.");
+                        {
+                            auto peer2 = g_conns.find(c->peer_fd);
+    if (peer_it == g_conns.end()) { close_conn(remote); return; }
+    Conn* local = peer_it->second;
+    LOG(LogLevel::INFO, "Client: got ServerHello, server_random extracted");
+    local->outbuf.insert(local->outbuf.end(), data, data + len);
+    mod_fd(local->fd, EPOLLIN | EPOLLOUT);
+    setup_hmac_from_random(remote, server_random, false);
+    setup_hmac_from_random(local, server_random, false);
+    remote->hmac_ignore.init((const uint8_t*)remote->password.data(), remote->password.size());
+    remote->hmac_ignore_active = true;
+    remote->handshake_done = true; local->handshake_done = true;
+    remote->hs_phase = HsPhase::Done; local->hs_phase = HsPhase::Done;
+    if (!local->inbuf.empty()) {
+        std::vector<uint8_t> wrapped;
+        build_first_appdata(local->inbuf.data(), local->inbuf.size(), remote->handshake_hmac, wrapped);
+        remote->first_appdata_sent = true;
+        remote->outbuf.insert(remote->outbuf.end(), wrapped.begin(), wrapped.end());
+        mod_fd(remote->fd, EPOLLIN | EPOLLOUT);
+        local->inbuf.clear();
+    }
+    LOG(LogLevel::INFO, "Client: handshake complete, entering HMAC relay mode");
+}
+
+void EventLoop::connect_to_data_target(Conn* client_conn, const uint8_t* server_random) {
+    std::string dhost; int dport;
+    parse_addr(cfg_.target_addr, dhost, dport);
+    sockaddr_storage sa; socklen_t sl;
+    if (!resolve(dhost, dport, sa, sl)) {
+        LOG(LogLevel::ERROR, "Server: failed to resolve data %s", cfg_.target_addr.c_str());
+        close_conn(client_conn); return;
+    }
+    int dfd = create_socket(sa.ss_family == AF_INET6);
+    set_nodelay(dfd); set_keepalive(dfd);
+    if (cfg_.fastopen) set_fastopen_connect(dfd);
+    if (connect(dfd, (sockaddr*)&sa, sl) < 0 && errno != EINPROGRESS) {
+        LOG(LogLevel::ERROR, "Server: connect data failed");
+        close(dfd); close_conn(client_conn); return;
+    }
+    Conn* data_conn = new Conn{};
+    data_conn->fd = dfd; data_conn->peer_fd = client_conn->fd;
+    data_conn->is_tls_side = false; data_conn->hs_phase = HsPhase::ServerConnectData;
+    data_conn->password = cfg_.password; client_conn->peer_fd = dfd;
+    setup_hmac_from_random(data_conn, server_random, true);
+    setup_hmac_from_random(client_conn, server_random, true);
+    add_fd(dfd, EPOLLIN | EPOLLOUT, data_conn);
+    LOG(LogLevel::INFO, "Server: connecting data %s:%d fd=%d", dhost.c_str(), dport, dfd);
+}
+
+// ===== Bind helper =====
+int bind_listener(const std::string& addr_str, bool fastopen) {
+    std::string host; int port;
+    if (!parse_addr(addr_str, host, port)) { fprintf(stderr, "Invalid listen: %s\n", addr_str.c_str()); return -1; }
+    sockaddr_storage addr; socklen_t alen;
+    if (!resolve(host, port, addr, alen)) resolve("::", port, addr, alen);
+    int fd = create_socket(addr.ss_family == AF_INET6);
+    set_reuseaddr(fd);
+    if (bind(fd, (sockaddr*)&addr, alen) < 0) { perror("bind"); close(fd); return -1; }
+    if (fastopen) { int qlen=FASTOPEN_QLEN; setsockopt(fd, IPPROTO_TCP, TCP_FASTOPEN, &qlen, sizeof(qlen)); }
+    if (listen(fd, LISTEN_BACKLOG) < 0) { perror("listen"); close(fd); return -1; }
+    LOG(LogLevel::INFO, "Listening on %s%s", addr_str.c_str(), fastopen?" (fastopen)":"");
+    return fd;
+}
+
+// ===== Config parsing =====
+static std::string json_get_str(const std::string& json, const std::string& key) {
+    std::string search = "\"" + key + "\"";
+    size_t pos = json.find(search); if (pos == std::string::npos) return "";
+    pos = json.find(':', pos + search.size()); if (pos == std::string::npos) return "";
+    pos = json.find('"', pos + 1); if (pos == std::string::npos) return "";
+    size_t end = json.find('"', pos + 1); if (end == std::string::npos) return "";
+    return json.substr(pos + 1, end - pos - 1);
+}
+static bool json_get_bool(const std::string& json, const std::string& key, bool def = false) {
+    std::string v = json_get_str(json, key);
+    if (v.empty()) {
+        std::string search = "\"" + key + "\""; size_t pos = json.find(search);
+        if (pos == std::string::npos) return def;
+        pos = json.find(':', pos + search.size()); if (pos == std::string::npos) return def;
+        pos = json.find_first_not_of(" \t\n\r", pos + 1); if (pos == std::string::npos) return def;
+        return json.substr(pos, 4) == "true";
+    }
+    return v == "true";
+}
+
+bool load_config_file(const std::string& path, Config& cfg, std::string& mode) {
+    FILE* f = fopen(path.c_str(), "r"); if (!f) return false;
+    std::string json; char buf[4096]; size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) json.append(buf, n);
+    fclose(f);
+    std::string cmd = json_get_str(json, "mode");
+    if (cmd.empty()) cmd = json_get_str(json, "client");
+    if (cmd.empty()) cmd = json_get_str(json, "server");
+    mode = cmd.empty() ? "client" : cmd;
+    cfg.server_mode = (mode == "server");
+    auto gs = [&](const char* k) { return json_get_str(json, k); };
+    cfg.listen_addr = gs("listen");
+    cfg.target_addr = gs("server_addr");
+    cfg.tls_host = gs("tls_names").empty() ? gs("tls_addr") : gs("tls_names");
+    cfg.tls_host = cfg.tls_host.empty() ? gs("tls") : cfg.tls_host;
+    cfg.tls_host = cfg.tls_host.empty() ? gs("sni") : cfg.tls_host;
+    cfg.password = gs("password");
+    if (cfg.tls_host.empty()) cfg.tls_host = gs("tls_names");
+    cfg.tls_addrs = TlsAddrs::parse(cfg.tls_host);
+    if (gs("threads").size()) cfg.threads = atoi(gs("threads").c_str());
+    cfg.fastopen = json_get_bool(json, "fastopen");
+    cfg.nodelay = !json_get_bool(json, "disable_nodelay");
+    if (json_get_bool(json, "v3")) cfg.v3 = json_get_bool(json, "strict") ? V3Mode::Strict : V3Mode::Lossy;
+    std::string ws = gs("wildcard_sni");
+    if (!ws.empty()) {
+        if (ws == "authed") { cfg.wildcard = WildcardSNI::Authed; cfg.tls_addrs.wildcard = WildcardSNI::Authed; }
+        else if (ws == "all") { cfg.wildcard = WildcardSNI::All; cfg.tls_addrs.wildcard = WildcardSNI::All; }
+    }
+    return !cfg.password.empty() && !cfg.tls_host.empty() && !cfg.target_addr.empty();
+}
+
+bool parse_sip003(Config& cfg, std::string& mode) {
+    auto getenv_or = [](const char* key, const char* def) -> std::string {
+        const char* v = getenv(key); return (v && v[0]) ? std::string(v) : std::string(def);
+    };
+    std::string opts = getenv_or("SS_PLUGIN_OPTIONS", "");
+    if (opts.empty()) return false;
+    std::map<std::string, std::string> kv;
+    size_t start = 0;
+    while (start < opts.size()) {
+        size_t eq = opts.find('=', start), end = opts.find(';', start);
+        if (end == std::string::npos) end = opts.size();
+        if (eq != std::string::npos && eq < end) {
+            kv[opts.substr(start, eq - start)] = opts.substr(eq + 1, end - eq - 1);
+        }
+        start = end + 1;
+    }
+    bool is_server = kv.count("server") > 0;
+    mode = is_server ? "server" : "client"; cfg.server_mode = is_server;
+    cfg.password = kv.count("passwd") ? kv["passwd"] : "";
+    if (kv.count("threads")) cfg.threads = atoi(kv["threads"].c_str());
+    if (kv.count("v3")) cfg.v3 = V3Mode::Lossy;
+    if (kv.count("strict")) cfg.v3 = V3Mode::Strict;
+    std::string rh = getenv_or("SS_REMOTE_HOST", ""), rp = getenv_or("SS_REMOTE_PORT", "");
+    std::string lh = getenv_or("SS_LOCAL_HOST", "127.0.0.1"), lp = getenv_or("SS_LOCAL_PORT", "");
+    if (is_server) {
+        cfg.listen_addr = rh + ":" + rp; cfg.target_addr = lh + ":" + lp;
+        cfg.tls_host = kv.count("tls") ? kv["tls"] : "";
+        cfg.tls_addrs = TlsAddrs::parse(cfg.tls_host);
+        if (kv.count("wildcard-sni")) {
+            std::string w = kv["wildcard-sni"];
+            if (w == "authed") { cfg.wildcard = WildcardSNI::Authed; cfg.tls_addrs.wildcard = WildcardSNI::Authed; }
+            else if (w == "all") { cfg.wildcard = WildcardSNI::All; cfg.tls_addrs.wildcard = WildcardSNI::All; }
+        }
+    } else {
+        cfg.listen_addr = lh + ":" + lp; cfg.target_addr = rh + ":" + rp;
+        cfg.tls_host = kv.count("host") ? kv["host"] : "";
+    }
+    return !cfg.password.empty() && !cfg.tls_host.empty();
+}
+
+void print_usage(const char* prog) {
+    fprintf(stderr,
+        "shadowtls-cpp v1.0\n"
+        "Usage:\n"
+        "  %s client --listen [::1]:8080 --server IP:443 --sni host.com --password SECRET\n"
+        "  %s server --listen [::]:443 --server 127.0.0.1:8080 --tls host.com:443 --password SECRET\n"
+        "  %s --config config.json\n"
+        "Options: --threads N --fastopen --v3 --strict --nodelay --disable-nodelay\n"
+        "         --alpn proto1;proto2 --wildcard-sni off|authed|all\n"
+        "         --sni host1;host2  --tls sni=ip:port;fallback:port\n", prog, prog, prog);
+}
+
+#ifndef TESTING
+// ===== Main =====
+static void sig_handler(int) { g_running = false; }
+
+int main(int argc, char** argv) {
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGINT, sig_handler);
+    signal(SIGTERM, sig_handler);
+    setbuf(stderr, NULL);
+    Config cfg; std::string mode;
+
+    bool from_sip003 = parse_sip003(cfg, mode);
+    if (!from_sip003) {
+        for (int i = 1; i < argc; i++) {
+            std::string a = argv[i];
+            if (a == "client") mode = "client";
+            else if (a == "server") mode = "server";
+            else if (a == "--listen" && i+1 < argc) cfg.listen_addr = argv[++i];
+            else if (a == "--server" && i+1 < argc) cfg.target_addr = argv[++i];
+            else if (a == "--sni" && i+1 < argc) cfg.tls_host = argv[++i];
+            else if (a == "--tls" && i+1 < argc) { cfg.tls_host = argv[++i]; cfg.tls_addrs = TlsAddrs::parse(cfg.tls_host); }
+            else if (a == "--password" && i+1 < argc) cfg.password = argv[++i];
+            else if (a == "--wildcard-sni" && i+1 < argc) {
+                std::string w = argv[++i];
+                if (w == "authed") { cfg.wildcard = WildcardSNI::Authed; cfg.tls_addrs.wildcard = WildcardSNI::Authed; }
+                else if (w == "all") { cfg.wildcard = WildcardSNI::All; cfg.tls_addrs.wildcard = WildcardSNI::All; }
+            }
+            else if (a == "--threads" && i+1 < argc) cfg.threads = atoi(argv[++i]);
+            else if (a == "--fastopen") cfg.fastopen = true;
+            else if (a == "--v3") cfg.v3 = V3Mode::Lossy;
+            else if (a == "--strict") cfg.v3 = V3Mode::Strict;
+            else if (a == "--nodelay") cfg.nodelay = true;
+            else if (a == "--disable-nodelay") cfg.nodelay = false;
+            else if (a == "--alpn" && i+1 < argc) {
+                std::string al = argv[++i]; size_t s = 0, e;
+                while ((e = al.find(';', s)) != std::string::npos) {
+                    if (e > s) cfg.alpn.push_back(al.substr(s, e - s)); s = e + 1;
+                }
+                if (s < al.size()) cfg.alpn.push_back(al.substr(s));
+            }
+            else if (a == "-h" || a == "--help") { print_usage(argv[0]); return 0; }
+            else if (a == "--config" && i+1 < argc) {
+                if (!load_config_file(argv[++i], cfg, mode)) {
+                    fprintf(stderr, "Failed to load config: %s\n", argv[i]); return 1;
+                }
+            }
+        }
+    }
+
+    if (mode.empty() || cfg.password.empty() || cfg.tls_host.empty() || cfg.target_addr.empty()) {
+        print_usage(argv[0]); return 1;
+    }
+    cfg.server_mode = (mode == "server");
+    if (cfg.threads <= 0) { cfg.threads = (int)std::thread::hardware_concurrency(); if (cfg.threads <= 0) cfg.threads = 1; }
+
+    int listener = bind_listener(cfg.listen_addr, cfg.fastopen);
+    if (listener < 0) return 1;
+    LOG(LogLevel::INFO, "shadowtls-cpp v1.0 %s mode, %d threads", cfg.server_mode?"server":"client", cfg.threads);
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < cfg.threads; i++) {
+        threads.emplace_back([&cfg, listener]() {
+            EventLoop loop(cfg);
+            loop.set_listener(listener);
+            loop.run();
+        });
+    }
+    for (auto& t : threads) t.join();
+    close(listener);
+    LOG(LogLevel::INFO, "shadowtls-cpp shutting down");
+    return 0;
+}
+#endif // TESTING

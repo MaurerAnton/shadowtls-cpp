@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/bym/shadowtls-cpp/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
