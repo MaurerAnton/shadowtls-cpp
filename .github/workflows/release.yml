@@ -36,16 +36,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
       - run: |
-          cd artifacts
+          mkdir -p out
           for d in shadowtls-*; do
-            mv "$d/shadowtls" "$d"
-            rmdir "$d"
+            [ -f "$d/shadowtls" ] && cp "$d/shadowtls" "out/$d"
           done
+          ls -la out/
       - uses: softprops/action-gh-release@v1
         with:
-          files: artifacts/shadowtls-*
+          files: out/*
           draft: false
           generate_release_notes: true
