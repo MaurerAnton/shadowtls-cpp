@@ -14,18 +14,38 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            static: false
+
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            static: true
 
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
       - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev
-      - name: Configure
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev musl-tools g++
+          bash scripts/setup-musl-gxx.sh
+
+      - name: Configure (dynamic)
+        if: ${{ !matrix.static }}
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF
+
+      - name: Configure (static musl)
+        if: ${{ matrix.static }}
+        run: |
+          CC=musl-gcc CXX=musl-g++ cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF
+
       - name: Build
         run: cmake --build build -j$(nproc)
+
       - name: Strip
         run: strip build/shadowtls
+
       - uses: actions/upload-artifact@v4
         with:
           name: shadowtls-${{ matrix.target }}
