@@ -1,115 +1,34 @@
-name: Build & Release
+name: Release
 on:
   push:
     tags: ['v*']
-  workflow_dispatch:
 
 jobs:
   build:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: linux-x86_64-gnu
-            os: ubuntu-latest
-            target: x86_64-linux-gnu
-            artifact: shadowtls-x86_64-unknown-linux-gnu
-
-          - name: linux-x86_64-musl
-            os: ubuntu-latest
-            target: x86_64-linux-musl
-            artifact: shadowtls-x86_64-unknown-linux-musl
-
-          - name: linux-i686-musl
-            os: ubuntu-latest
-            target: i686-linux-musl
-            artifact: shadowtls-i686-unknown-linux-musl
-
-          - name: linux-aarch64-musl
-            os: ubuntu-latest
-            target: aarch64-linux-musl
-            artifact: shadowtls-aarch64-unknown-linux-musl
-
-          - name: linux-arm-musleabi
-            os: ubuntu-latest
-            target: arm-linux-musleabi
-            artifact: shadowtls-arm-unknown-linux-musleabi
-
-          - name: linux-armv7-musleabihf
-            os: ubuntu-latest
-            target: armv7-linux-musleabihf
-            artifact: shadowtls-armv7-unknown-linux-musleabihf
-
-          - name: macos-x86_64
-            os: macos-13
-            target: darwin-x86_64
-            artifact: shadowtls-x86_64-apple-darwin
-
-          - name: macos-aarch64
-            os: macos-latest
-            target: darwin-aarch64
-            artifact: shadowtls-aarch64-apple-darwin
-
+        os: [ubuntu-latest, macos-latest, macos-13]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install cross-compilers (Linux)
+      - name: Install deps (Linux)
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools g++-multilib \
-            g++-aarch64-linux-gnu g++-arm-linux-gnueabi g++-arm-linux-gnueabihf
-          for t in aarch64-linux-musl arm-linux-musleabi arm-linux-musleabihf i686-linux-musl; do
-            case $t in
-              aarch64*) gcc_base=aarch64-linux-gnu ;;
-              arm-linux-musleabi) gcc_base=arm-linux-gnueabi ;;
-              armv7*) gcc_base=arm-linux-gnueabihf ;;
-              i686*) gcc_base=x86_64-linux-gnu ; CFLAG=-m32 ;;
-            esac
-            [ -n "$CFLAG" ] && echo '#!/bin/sh' > /usr/local/bin/${t}-gcc && echo "exec ${gcc_base}-gcc $CFLAG \"\$@\"" >> /usr/local/bin/${t}-gcc && chmod +x /usr/local/bin/${t}-gcc && echo '#!/bin/sh' > /usr/local/bin/${t}-g++ && echo "exec ${gcc_base}-g++ $CFLAG \"\$@\"" >> /usr/local/bin/${t}-g++ && chmod +x /usr/local/bin/${t}-g++ || { sudo ln -sf /usr/bin/${gcc_base}-gcc /usr/local/bin/${t}-gcc; sudo ln -sf /usr/bin/${gcc_base}-g++ /usr/local/bin/${t}-g++; }
-          done
-
-      - name: Build static OpenSSL (Linux cross)
-        if: runner.os == 'Linux' && matrix.target != 'x86_64-linux-gnu'
-        run: |
-          export OPENSSL_PREFIX=/tmp/openssl-${{ matrix.target }}
-          bash scripts/build-openssl.sh ${{ matrix.target }} $OPENSSL_PREFIX
-          echo "OPENSSL_PREFIX=$OPENSSL_PREFIX" >> $GITHUB_ENV
-
-      - name: Configure (Linux cross)
-        if: runner.os == 'Linux' && matrix.target != 'x86_64-linux-gnu'
-        run: |
-          cmake -B build \
-            -DCMAKE_TOOLCHAIN_FILE=cmake/${{ matrix.target }}.cmake \
-            -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF
-
-      - name: Configure (Linux gnu native)
-        if: matrix.target == 'x86_64-linux-gnu'
-        run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF
-
-      - name: Configure (macOS)
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - name: Install deps (macOS)
         if: runner.os == 'macOS'
-        run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF
-
+        run: brew install openssl
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF
       - name: Build
         run: cmake --build build -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
-
-      - name: Strip
-        run: strip build/shadowtls
-
-      - name: Upload artifact
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
+          name: shadowtls-${{ runner.os }}-${{ runner.arch }}
           path: build/shadowtls
 
   release:
-    name: Create Release
-    if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
     steps:
@@ -118,6 +37,6 @@ jobs:
           path: artifacts
       - uses: softprops/action-gh-release@v1
         with:
-          files: artifacts/shadowtls-*/shadowtls
+          files: artifacts/*/shadowtls
           draft: false
           generate_release_notes: true
