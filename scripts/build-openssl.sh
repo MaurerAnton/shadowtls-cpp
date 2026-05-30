@@ -29,6 +29,11 @@ case "$TARGET" in
         CC="arm-linux-musleabihf-gcc"
         CXX="arm-linux-musleabihf-g++"
         ;;
+    i686-linux-musl)
+        OPENSSL_TARGET="linux-x86"
+        CC="i686-linux-musl-gcc"
+        CXX="i686-linux-musl-g++"
+        ;; 
     *)
         echo "Unknown target: $TARGET"
         exit 1

@@ -12,10 +12,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - name: linux-x86_64-gnu
+            os: ubuntu-latest
+            target: x86_64-linux-gnu
+            artifact: shadowtls-x86_64-unknown-linux-gnu
+
           - name: linux-x86_64-musl
             os: ubuntu-latest
             target: x86_64-linux-musl
             artifact: shadowtls-x86_64-unknown-linux-musl
+
+          - name: linux-i686-musl
+            os: ubuntu-latest
+            target: i686-linux-musl
+            artifact: shadowtls-i686-unknown-linux-musl
 
           - name: linux-aarch64-musl
             os: ubuntu-latest
@@ -45,40 +55,45 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Linux cross-compilers (musl)
+      - name: Install cross-compilers (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools g++-aarch64-linux-gnu g++-arm-linux-gnueabi g++-arm-linux-gnueabihf
-          # Create symlinks for musl cross-compilers
-          for t in aarch64-linux-musl arm-linux-musleabi arm-linux-musleabihf; do
-            base=${t%-*}
-            if [ "$base" = "aarch64" ]; then gcc_base=aarch64-linux-gnu; else gcc_base=$base; fi
-            sudo ln -sf /usr/bin/${gcc_base}-gcc /usr/local/bin/${t}-gcc 2>/dev/null || true
-            sudo ln -sf /usr/bin/${gcc_base}-g++ /usr/local/bin/${t}-g++ 2>/dev/null || true
+          sudo apt-get install -y musl-tools g++-multilib \
+            g++-aarch64-linux-gnu g++-arm-linux-gnueabi g++-arm-linux-gnueabihf
+          for t in aarch64-linux-musl arm-linux-musleabi arm-linux-musleabihf i686-linux-musl; do
+            case $t in
+              aarch64*) gcc_base=aarch64-linux-gnu ;;
+              arm-linux-musleabi) gcc_base=arm-linux-gnueabi ;;
+              armv7*) gcc_base=arm-linux-gnueabihf ;;
+              i686*) gcc_base=x86_64-linux-gnu ; CFLAG=-m32 ;;
+            esac
+            [ -n "$CFLAG" ] && echo '#!/bin/sh' > /usr/local/bin/${t}-gcc && echo "exec ${gcc_base}-gcc $CFLAG \"\$@\"" >> /usr/local/bin/${t}-gcc && chmod +x /usr/local/bin/${t}-gcc && echo '#!/bin/sh' > /usr/local/bin/${t}-g++ && echo "exec ${gcc_base}-g++ $CFLAG \"\$@\"" >> /usr/local/bin/${t}-g++ && chmod +x /usr/local/bin/${t}-g++ || { sudo ln -sf /usr/bin/${gcc_base}-gcc /usr/local/bin/${t}-gcc; sudo ln -sf /usr/bin/${gcc_base}-g++ /usr/local/bin/${t}-g++; }
           done
 
-      - name: Build static OpenSSL (Linux musl)
-        if: runner.os == 'Linux'
+      - name: Build static OpenSSL (Linux cross)
+        if: runner.os == 'Linux' && matrix.target != 'x86_64-linux-gnu'
         run: |
           export OPENSSL_PREFIX=/tmp/openssl-${{ matrix.target }}
           bash scripts/build-openssl.sh ${{ matrix.target }} $OPENSSL_PREFIX
           echo "OPENSSL_PREFIX=$OPENSSL_PREFIX" >> $GITHUB_ENV
 
-      - name: Configure (Linux musl)
-        if: runner.os == 'Linux'
+      - name: Configure (Linux cross)
+        if: runner.os == 'Linux' && matrix.target != 'x86_64-linux-gnu'
         run: |
           cmake -B build \
             -DCMAKE_TOOLCHAIN_FILE=cmake/${{ matrix.target }}.cmake \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_TESTS=OFF
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF
+
+      - name: Configure (Linux gnu native)
+        if: matrix.target == 'x86_64-linux-gnu'
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF
 
       - name: Configure (macOS)
         if: runner.os == 'macOS'
         run: |
-          cmake -B build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_TESTS=OFF
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF
 
       - name: Build
         run: cmake --build build -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
@@ -101,8 +116,8 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
+      - uses: softprops/action-gh-release@v1
         with:
-          files: artifacts/*/shadowtls*
-          draft: true
+          files: artifacts/shadowtls-*/shadowtls
+          draft: false
+          generate_release_notes: true

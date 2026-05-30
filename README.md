@@ -16,7 +16,9 @@ Download from [Releases](https://github.com/MaurerAnton/shadowtls-cpp/releases):
 
 | Target | |
 |--------|---|
+| `x86_64-unknown-linux-gnu` | Linux x86_64 (glibc) |
 | `x86_64-unknown-linux-musl` | Linux x86_64 (static) |
+| `i686-unknown-linux-musl` | Linux i686 32-bit (static) |
 | `aarch64-unknown-linux-musl` | Linux ARM64 (static) |
 | `arm-unknown-linux-musleabi` | Linux ARM32 (static) |
 | `armv7-unknown-linux-musleabihf` | Linux ARMv7 (static) |
