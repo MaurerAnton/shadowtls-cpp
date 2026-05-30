@@ -14,31 +14,27 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            static: false
 
-          - target: x86_64-unknown-linux-musl
+          - target: x86_64-unknown-linux-static
             os: ubuntu-latest
-            static: true
 
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev musl-tools g++
-          bash scripts/setup-musl-gxx.sh
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
 
       - name: Configure (dynamic)
-        if: ${{ !matrix.static }}
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF
 
-      - name: Configure (static musl)
-        if: ${{ matrix.static }}
+      - name: Configure (static)
+        if: matrix.target == 'x86_64-unknown-linux-static'
         run: |
-          CC=musl-gcc CXX=musl-g++ cmake -B build \
-            -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF \
+            -DCMAKE_EXE_LINKER_FLAGS="-static" \
+            -DCMAKE_FIND_LIBRARY_SUFFIXES=".a"
 
       - name: Build
         run: cmake --build build -j$(nproc)
