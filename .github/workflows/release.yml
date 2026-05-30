@@ -46,7 +46,13 @@ jobs:
         if: ${{ matrix.static }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools g++-aarch64-linux-gnu g++-arm-linux-gnueabihf
+          sudo apt-get install -y musl-tools g++ g++-aarch64-linux-gnu g++-arm-linux-gnueabihf
+          # Create musl-g++ wrapper (musl-tools only provides musl-gcc)
+          sudo tee /usr/local/bin/musl-g++ << 'EOF' > /dev/null
+          #!/bin/sh
+          exec musl-gcc -x c++ "$@"
+          EOF
+          sudo chmod +x /usr/local/bin/musl-g++
           sudo ln -sf /usr/bin/aarch64-linux-gnu-gcc /usr/local/bin/aarch64-linux-musl-gcc
           sudo ln -sf /usr/bin/aarch64-linux-gnu-g++ /usr/local/bin/aarch64-linux-musl-g++
           sudo ln -sf /usr/bin/arm-linux-gnueabihf-gcc /usr/local/bin/arm-linux-musleabihf-gcc
