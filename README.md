@@ -10,6 +10,19 @@ C++ port of [shadow-tls](https://github.com/ihciah/shadow-tls) — a proxy that 
 cmake -B build && cmake --build build
 ```
 
+### Pre-built binaries
+
+Download from [Releases](https://github.com/MaurerAnton/shadowtls-cpp/releases):
+
+| Target | |
+|--------|---|
+| `x86_64-unknown-linux-musl` | Linux x86_64 (static) |
+| `aarch64-unknown-linux-musl` | Linux ARM64 (static) |
+| `arm-unknown-linux-musleabi` | Linux ARM32 (static) |
+| `armv7-unknown-linux-musleabihf` | Linux ARMv7 (static) |
+| `x86_64-apple-darwin` | macOS Intel |
+| `aarch64-apple-darwin` | macOS Apple Silicon |
+
 ## Usage
 
 ### Server
