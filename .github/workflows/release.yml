@@ -1,0 +1,108 @@
+name: Build & Release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64-musl
+            os: ubuntu-latest
+            target: x86_64-linux-musl
+            artifact: shadowtls-x86_64-unknown-linux-musl
+
+          - name: linux-aarch64-musl
+            os: ubuntu-latest
+            target: aarch64-linux-musl
+            artifact: shadowtls-aarch64-unknown-linux-musl
+
+          - name: linux-arm-musleabi
+            os: ubuntu-latest
+            target: arm-linux-musleabi
+            artifact: shadowtls-arm-unknown-linux-musleabi
+
+          - name: linux-armv7-musleabihf
+            os: ubuntu-latest
+            target: armv7-linux-musleabihf
+            artifact: shadowtls-armv7-unknown-linux-musleabihf
+
+          - name: macos-x86_64
+            os: macos-13
+            target: darwin-x86_64
+            artifact: shadowtls-x86_64-apple-darwin
+
+          - name: macos-aarch64
+            os: macos-latest
+            target: darwin-aarch64
+            artifact: shadowtls-aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux cross-compilers (musl)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools g++-aarch64-linux-gnu g++-arm-linux-gnueabi g++-arm-linux-gnueabihf
+          # Create symlinks for musl cross-compilers
+          for t in aarch64-linux-musl arm-linux-musleabi arm-linux-musleabihf; do
+            base=${t%-*}
+            if [ "$base" = "aarch64" ]; then gcc_base=aarch64-linux-gnu; else gcc_base=$base; fi
+            sudo ln -sf /usr/bin/${gcc_base}-gcc /usr/local/bin/${t}-gcc 2>/dev/null || true
+            sudo ln -sf /usr/bin/${gcc_base}-g++ /usr/local/bin/${t}-g++ 2>/dev/null || true
+          done
+
+      - name: Build static OpenSSL (Linux musl)
+        if: runner.os == 'Linux'
+        run: |
+          export OPENSSL_PREFIX=/tmp/openssl-${{ matrix.target }}
+          bash scripts/build-openssl.sh ${{ matrix.target }} $OPENSSL_PREFIX
+          echo "OPENSSL_PREFIX=$OPENSSL_PREFIX" >> $GITHUB_ENV
+
+      - name: Configure (Linux musl)
+        if: runner.os == 'Linux'
+        run: |
+          cmake -B build \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/${{ matrix.target }}.cmake \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTS=OFF
+
+      - name: Configure (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTS=OFF
+
+      - name: Build
+        run: cmake --build build -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+
+      - name: Strip
+        run: strip build/shadowtls
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: build/shadowtls
+
+  release:
+    name: Create Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: artifacts/*/shadowtls*
+          draft: true
