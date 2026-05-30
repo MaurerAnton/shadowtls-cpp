@@ -11,24 +11,85 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest]
+        include:
+          - name: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            static: false
+
+          - name: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            static: true
+            cc: musl-gcc
+            cxx: musl-g++
+
+          - name: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            static: true
+            cc: aarch64-linux-musl-gcc
+            cxx: aarch64-linux-musl-g++
+
+          - name: armv7-unknown-linux-musleabihf
+            os: ubuntu-latest
+            static: true
+            cc: arm-linux-musleabihf-gcc
+            cxx: arm-linux-musleabihf-g++
+
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install deps (Linux)
-        if: runner.os == 'Linux'
+
+      - name: Install deps (native)
+        if: ${{ !matrix.static }}
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
-      - name: Install deps (macOS)
-        if: runner.os == 'macOS'
-        run: brew install openssl
-      - name: Configure
+
+      - name: Install cross-compilers (static musl)
+        if: ${{ matrix.static }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools g++-aarch64-linux-gnu g++-arm-linux-gnueabihf
+          sudo ln -sf /usr/bin/aarch64-linux-gnu-gcc /usr/local/bin/aarch64-linux-musl-gcc
+          sudo ln -sf /usr/bin/aarch64-linux-gnu-g++ /usr/local/bin/aarch64-linux-musl-g++
+          sudo ln -sf /usr/bin/arm-linux-gnueabihf-gcc /usr/local/bin/arm-linux-musleabihf-gcc
+          sudo ln -sf /usr/bin/arm-linux-gnueabihf-g++ /usr/local/bin/arm-linux-musleabihf-g++
+
+      - name: Build static OpenSSL (musl)
+        if: ${{ matrix.static }}
+        run: |
+          OPENSSL_PREFIX=/tmp/openssl-${{ matrix.name }}
+          curl -fsSL https://www.openssl.org/source/openssl-3.4.0.tar.gz | tar xz
+          cd openssl-3.4.0
+          case ${{ matrix.name }} in
+            x86_64-*)   target=linux-x86_64 ;;
+            aarch64-*)  target=linux-aarch64 ;;
+            armv7-*)    target=linux-armv4 ;;
+          esac
+          CC=${{ matrix.cc }} CXX=${{ matrix.cxx }} ./Configure $target no-shared no-tests --prefix=$OPENSSL_PREFIX
+          make -j$(nproc) && make install_sw
+          echo "OPENSSL_ROOT_DIR=$OPENSSL_PREFIX" >> $GITHUB_ENV
+
+      - name: Configure (native)
+        if: ${{ !matrix.static }}
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF
+
+      - name: Configure (static musl)
+        if: ${{ matrix.static }}
+        run: |
+          cmake -B build \
+            -DCMAKE_C_COMPILER=${{ matrix.cc }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTS=OFF
+
       - name: Build
-        run: cmake --build build -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+        run: cmake --build build -j$(nproc)
+
+      - name: Strip
+        run: strip build/shadowtls
+
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: shadowtls-${{ runner.os }}-${{ runner.arch }}
+          name: shadowtls-${{ matrix.name }}
           path: build/shadowtls
 
   release:
@@ -38,8 +99,15 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+      - run: |
+          cd artifacts
+          for d in shadowtls-*; do
+            mv "$d/shadowtls" "$d"
+            rmdir "$d"
+          done
+          ls -la
       - uses: softprops/action-gh-release@v1
         with:
-          files: artifacts/*/shadowtls
+          files: artifacts/shadowtls-*
           draft: false
           generate_release_notes: true
