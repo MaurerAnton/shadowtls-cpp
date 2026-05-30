@@ -1,1 +1,0 @@
-/usr/bin/c++ -Wl,--dependency-file=CMakeFiles/shadowtls.dir/link.d CMakeFiles/shadowtls.dir/src/main.cpp.o CMakeFiles/shadowtls.dir/src/protocol.cpp.o -o shadowtls  /usr/lib/libssl.so /usr/lib/libcrypto.so -lpthread

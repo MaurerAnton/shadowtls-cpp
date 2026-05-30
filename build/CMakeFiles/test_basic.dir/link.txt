@@ -1,1 +1,0 @@
-/usr/bin/c++ -Wl,--dependency-file=CMakeFiles/test_basic.dir/link.d CMakeFiles/test_basic.dir/tests/test_basic.cpp.o CMakeFiles/test_basic.dir/src/main.cpp.o CMakeFiles/test_basic.dir/src/protocol.cpp.o -o test_basic  /usr/lib/libssl.so /usr/lib/libcrypto.so -lpthread
